@@ -1,0 +1,17 @@
+{
+  "name": "browser-automation-core",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Persistent Chrome browser automation core for Playwright and Stagehand.",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "start": "ts-node main.ts"
+  },
+  "dependencies": {
+    "@browserbasehq/stagehand": "^3.0.0",
+    "playwright": "^1.54.2",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.8.3",
+    "zod": "^3.25.76"
+  }
+}

@@ -1,216 +1,198 @@
-/**
- * browser_core.ts
- * ─────────────────────────────────────────────────────────────────
- * Global reusable browser connection utilities.
- * Works with any Chromium-based browser on any debug port.
- *
- * Speed philosophy:
- *   • Always connect to an already-open browser (never launch inside TS)
- *   • Find tabs by URL pattern — never by title (titles change constantly)
- *   • All waits use condition-based polling, never fixed timeouts
- *   • Clicks go through page.evaluate() → el.click() when possible
- *     (skips Playwright's retry/scroll overhead for known-good selectors)
- *   • Inputs use triple-click + keyboard.type with delay:0 (fastest fill)
- * ─────────────────────────────────────────────────────────────────
- */
+import fs from "node:fs";
+import path from "node:path";
+import { chromium, type Browser, type BrowserContext, type Locator, type Page } from "playwright";
 
-import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
+function logActionError(action: string, selector: string, error: unknown): void {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(`[BROWSER_CORE] ${action} failed for "${selector}": ${message}`);
+}
 
-// ─── Connection ───────────────────────────────────────────────────────────────
-
-/**
- * Connect to an already-running Chrome/Chromium instance via CDP.
- * Run launch_browser.bat first to bind the debug port.
- */
+/** Connect to an already-running Chrome instance via CDP. */
 export async function connectBrowser(port = 9222): Promise<Browser> {
   return chromium.connectOverCDP(`http://localhost:${port}`);
 }
 
-/**
- * Get all open pages across all contexts in the connected browser.
- */
+/** Return every open page across all browser contexts. */
 export function getAllPages(browser: Browser): Page[] {
-  return browser.contexts().flatMap((ctx: BrowserContext) => ctx.pages());
+  return browser.contexts().flatMap((context: BrowserContext) => context.pages());
 }
 
-/**
- * Find a page whose URL contains the given pattern.
- * Uses URL matching — NEVER title matching (titles change constantly).
- *
- * @param urlPattern  e.g. "exness.com/webtrading" or "github.com"
- */
+/** Find the first page whose URL contains the provided pattern. */
 export function findPageByUrl(browser: Browser, urlPattern: string): Page | null {
-  return (
-    getAllPages(browser).find((p) => p.url().includes(urlPattern)) ?? null
-  );
+  return getAllPages(browser).find((page: Page) => page.url().includes(urlPattern)) ?? null;
 }
 
-/**
- * Find a page by URL, or open a new tab navigating to `openUrl` if not found.
- * Returns the existing or newly created page.
- */
-export async function getOrOpenPage(
-  browser: Browser,
-  urlPattern: string,
-  openUrl: string,
-): Promise<Page> {
+/** Return a matching page or open a new tab if none exists. */
+export async function getOrOpenPage(browser: Browser, urlPattern: string, openUrl: string): Promise<Page> {
   const existing = findPageByUrl(browser, urlPattern);
   if (existing) {
     await existing.bringToFront();
     return existing;
   }
+
   const context = browser.contexts()[0] ?? (await browser.newContext());
   const page = await context.newPage();
   await page.goto(openUrl, { waitUntil: "domcontentloaded" });
   return page;
 }
 
-// ─── Fast Actions ─────────────────────────────────────────────────────────────
+/** Return the active Framer page or throw when it is missing. */
+export function getFramerPage(browser: Browser): Page {
+  const page = findPageByUrl(browser, "framer.com");
+  if (!page) {
+    throw new Error("No Framer tab was found. Open the Framer editor in the persistent Chrome session first.");
+  }
+  return page;
+}
 
-/**
- * Click an element using the fastest available method.
- *
- * Speed order:
- *   1. page.evaluate() → el.click()        — zero overhead, synchronous DOM click
- *   2. page.locator(sel).click()            — Playwright click with retry logic
- *   3. Returns false if both fail
- *
- * Use this for buttons and links where you have a known selector.
- */
-export async function fastClick(
+/** Click with Playwright actionability checks and retry support. */
+export async function smartClick(
   page: Page,
   selector: string,
-  opts: { timeout?: number; force?: boolean } = {},
+  opts: { timeoutMs?: number; force?: boolean } = {},
 ): Promise<boolean> {
-  // Method 1: direct DOM click (fastest — no Playwright retry overhead)
-  const clicked = await page.evaluate((sel: string) => {
-    const el = document.querySelector(sel) as HTMLElement | null;
-    if (el) { el.click(); return true; }
-    return false;
-  }, selector).catch(() => false);
-
-  if (clicked) return true;
-
-  // Method 2: Playwright locator (handles visibility, scrolling, retries)
   try {
-    await page
-      .locator(selector)
-      .first()
-      .click({ timeout: opts.timeout ?? 5000, force: opts.force });
+    await page.locator(selector).first().click({
+      timeout: opts.timeoutMs ?? 5000,
+      force: opts.force,
+    });
     return true;
-  } catch {
+  } catch (error: unknown) {
+    logActionError("smartClick", selector, error);
     return false;
   }
 }
 
-/**
- * Fill an input field as fast as possible.
- *
- * Strategy:
- *   1. Focus the element
- *   2. Ctrl+A to select all existing content
- *   3. Type the new value with delay:0 (no artificial keystroke delay)
- *
- * This is faster than page.fill() because it skips the internal clear step
- * that Playwright does via triple-click, which can cause React re-renders.
- */
-export async function fastFill(
+/** Click the DOM node directly without Playwright safety checks. */
+export async function rawDomClick(page: Page, selector: string): Promise<boolean> {
+  try {
+    return await page.evaluate((value: string) => {
+      const element = document.querySelector<HTMLElement>(value);
+      if (!element) {
+        return false;
+      }
+      element.click();
+      return true;
+    }, selector);
+  } catch (error: unknown) {
+    logActionError("rawDomClick", selector, error);
+    return false;
+  }
+}
+
+/** Fill an input with locator.fill() and optionally commit with Tab. */
+export async function smartFill(
   page: Page,
   selector: string,
   value: string,
+  opts: { timeoutMs?: number; commit?: boolean } = {},
 ): Promise<boolean> {
+  const locator = page.locator(selector).first();
   try {
-    const el = page.locator(selector).first();
-    await el.focus({ timeout: 3000 });
-    await page.keyboard.press("Control+a");
+    await locator.click({ timeout: opts.timeoutMs ?? 3000 });
+    await locator.fill(value, { timeout: opts.timeoutMs ?? 3000 });
+    if (opts.commit ?? true) {
+      await locator.press("Tab", { timeout: opts.timeoutMs ?? 3000 });
+    }
+    return true;
+  } catch (error: unknown) {
+    logActionError("smartFill", selector, error);
+    return false;
+  }
+}
+
+/** Fill an input with keyboard events for controls that reject locator.fill(). */
+export async function keyboardFill(page: Page, selector: string, value: string): Promise<boolean> {
+  const locator = page.locator(selector).first();
+  try {
+    await locator.focus({ timeout: 3000 });
+    await page.keyboard.press("Control+A");
     await page.keyboard.type(value, { delay: 0 });
     return true;
-  } catch {
+  } catch (error: unknown) {
+    logActionError("keyboardFill", selector, error);
     return false;
   }
 }
 
-/**
- * Wait for an element to appear in the DOM.
- * Condition-based — never uses a fixed timeout.
- */
-export async function waitForElement(
-  page: Page,
-  selector: string,
-  timeoutMs = 5000,
-): Promise<boolean> {
+/** Retry an async action with exponential back-off. */
+export async function retryAction<T>(fn: () => Promise<T>, maxAttempts = 3, delayMs = 500): Promise<T> {
+  let lastError: unknown;
+  let nextDelay = delayMs;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await fn();
+    } catch (error: unknown) {
+      lastError = error;
+      if (attempt === maxAttempts) {
+        break;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, nextDelay));
+      nextDelay *= 2;
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+/** Wait for a selector to become visible. */
+export async function waitForElement(page: Page, selector: string, timeoutMs = 5000): Promise<boolean> {
   try {
-    await page.waitForSelector(selector, { state: "visible", timeout: timeoutMs });
+    await page.locator(selector).first().waitFor({ state: "visible", timeout: timeoutMs });
     return true;
-  } catch {
+  } catch (error: unknown) {
+    logActionError("waitForElement", selector, error);
     return false;
   }
 }
 
-/**
- * Wait for any one of multiple selectors to appear.
- * Returns the selector that appeared first, or null if none did.
- */
-export async function waitForAny(
-  page: Page,
-  selectors: string[],
-  timeoutMs = 5000,
-): Promise<string | null> {
-  const result = await Promise.race(
-    selectors.map((sel) =>
-      page
-        .waitForSelector(sel, { state: "visible", timeout: timeoutMs })
-        .then(() => sel)
-        .catch(() => null),
-    ),
-  );
+/** Return the first selector that becomes visible. */
+export async function waitForAny(page: Page, selectors: string[], timeoutMs = 5000): Promise<string | null> {
+  const attempts = selectors.map(async (selector: string) => {
+    try {
+      await page.locator(selector).first().waitFor({ state: "visible", timeout: timeoutMs });
+      return selector;
+    } catch {
+      return null;
+    }
+  });
+  const result = await Promise.race(attempts);
   return result ?? null;
 }
 
-/**
- * Read the visible text content of an element.
- * Returns null if element not found.
- */
+/** Read the visible text content of the first matching element. */
 export async function readText(page: Page, selector: string): Promise<string | null> {
   try {
     return await page.locator(selector).first().innerText({ timeout: 3000 });
-  } catch {
+  } catch (error: unknown) {
+    logActionError("readText", selector, error);
     return null;
   }
 }
 
-/**
- * Take a fast screenshot of a specific element only (not the full page).
- * Falls back to a viewport screenshot if the element is not found.
- */
-export async function screenshotElement(
-  page: Page,
-  selector: string | null,
-  outputPath: string,
-): Promise<void> {
+/** Capture an element screenshot or fall back to the current viewport. */
+export async function screenshotElement(page: Page, selector: string | null, outputPath: string): Promise<void> {
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true });
   if (selector) {
-    const el = page.locator(selector).first();
-    const count = await el.count().catch(() => 0);
-    if (count > 0) {
-      await el.screenshot({ path: outputPath });
+    const locator: Locator = page.locator(selector).first();
+    if (await locator.isVisible().catch(() => false)) {
+      await locator.screenshot({ path: outputPath });
       return;
     }
   }
-  // Fallback: viewport-only screenshot (much faster than fullPage: true)
   await page.screenshot({ path: outputPath, fullPage: false });
 }
 
-// ─── Utility ──────────────────────────────────────────────────────────────────
-
-/**
- * Check if the debug endpoint is responding.
- * Use this for the health check (HC-2) before connecting.
- */
+/** Check whether the debug endpoint is currently reachable. */
 export async function isDebugPortReady(port = 9222): Promise<boolean> {
   try {
-    const res = await fetch(`http://localhost:${port}/json`, { signal: AbortSignal.timeout(3000) });
-    return res.ok;
-  } catch {
+    const response = await fetch(`http://localhost:${port}/json`, {
+      signal: AbortSignal.timeout(3000),
+    });
+    return response.ok;
+  } catch (error: unknown) {
+    console.error(`[BROWSER_CORE] Debug port check failed: ${error instanceof Error ? error.message : String(error)}`);
     return false;
   }
 }

@@ -1,183 +1,157 @@
-/**
- * selector_store.ts
- * ─────────────────────────────────────────────────────────────────
- * Generic selector caching system. Copy this pattern into every
- * new project. Replace the SelectorMap interface and discovery
- * logic with whatever is needed for that specific site.
- *
- * SPEED RULE: Discovery only runs ONCE per site. After the JSON
- * cache file is written with selectorsDiscovered:true, the code
- * reads from the JSON file only — never hits the DOM again on
- * every cycle. This makes repeated automation cycles instant.
- * ─────────────────────────────────────────────────────────────────
- */
-
 import fs from "node:fs";
 import path from "node:path";
-import type { Page } from "playwright";
+import type { Locator, Page } from "playwright";
+import { getActiveStagehand, observe } from "@bac/stagehand_core";
 
-// ─── 1. Define your selector map here ────────────────────────────────────────
-//     Replace this interface with the elements your project actually needs.
-//     Keep null as the default — discovery will fill them in.
-
-export interface SelectorMap {
-  // Generic interactive elements
-  primaryActionBtn:  string | null;
-  secondaryActionBtn: string | null;
-  mainInput:         string | null;
-  searchInput:       string | null;
-  confirmBtn:        string | null;
-  cancelBtn:         string | null;
-  // Data display
-  mainContainer:     string | null;
-  dataTable:         string | null;
-  dataRow:           string | null;
-  // Feedback
-  toastContainer:    string | null;
-  errorMessage:      string | null;
-  loadingIndicator:  string | null;
-  // Meta
+export type SelectorCacheRecord = {
   selectorsDiscovered: boolean;
-  discoveryNote:       string;
+  discoveryNote: string;
+} & Record<string, string | boolean | null>;
+
+export type SelectorCacheKey<T extends SelectorCacheRecord> = Exclude<keyof T, "selectorsDiscovered" | "discoveryNote">;
+
+export interface ResolveSelectorOptions {
+  jsonPath?: string;
+  timeoutMs?: number;
+  descriptions?: Partial<Record<string, string>>;
 }
 
-// ─── 2. Set defaults (all null except meta) ───────────────────────────────────
+/** Return the default path for selector cache files. */
+export function getDefaultSelectorsPath(): string {
+  return path.join(process.cwd(), "selectors.json");
+}
 
-const DEFAULT_SELECTORS: SelectorMap = {
-  primaryActionBtn:  null,
-  secondaryActionBtn: null,
-  mainInput:         null,
-  searchInput:       null,
-  confirmBtn:        null,
-  cancelBtn:         null,
-  mainContainer:     null,
-  dataTable:         null,
-  dataRow:           null,
-  toastContainer:    null,
-  errorMessage:      null,
-  loadingIndicator:  null,
-  selectorsDiscovered: false,
-  discoveryNote: "Discovery has not run yet for this project.",
-};
-
-// ─── 3. Path to this project's JSON cache ─────────────────────────────────────
-//     Change this to match your project folder.
-
-const SELECTORS_PATH = path.join(process.cwd(), "selectors.json");
-
-// ─── 4. Load from JSON cache (runs at module import time) ─────────────────────
-
-export function loadSelectors(jsonPath = SELECTORS_PATH): SelectorMap {
+/** Load a selector cache file and merge it with defaults. */
+export function loadSelectorCache<T extends SelectorCacheRecord>(defaults: T, jsonPath = getDefaultSelectorsPath()): T {
   try {
     return {
-      ...DEFAULT_SELECTORS,
-      ...(JSON.parse(fs.readFileSync(jsonPath, "utf8")) as Partial<SelectorMap>),
+      ...defaults,
+      ...(JSON.parse(fs.readFileSync(jsonPath, "utf8")) as Partial<T>),
     };
   } catch {
-    return { ...DEFAULT_SELECTORS };
+    return { ...defaults };
   }
 }
 
-// ─── 5. Save to JSON cache ────────────────────────────────────────────────────
-
-export function saveSelectors(
-  selectors: SelectorMap,
-  jsonPath = SELECTORS_PATH,
-): void {
+/** Persist a selector cache file to disk. */
+export function saveSelectorCache<T extends SelectorCacheRecord>(selectors: T, jsonPath = getDefaultSelectorsPath()): void {
+  fs.mkdirSync(path.dirname(jsonPath), { recursive: true });
   fs.writeFileSync(jsonPath, JSON.stringify(selectors, null, 2));
 }
 
-// ─── 6. Merge helper — only overwrite if new value is not null ─────────────────
-
-export function mergeSelectors(
-  base: SelectorMap,
-  overrides: Partial<SelectorMap>,
-): SelectorMap {
+/** Merge non-null selector values into an existing cache object. */
+export function mergeSelectorCache<T extends SelectorCacheRecord>(base: T, overrides: Partial<T>): T {
+  const nextEntries = Object.entries(overrides).filter(([, value]) => value !== null && value !== undefined);
   return {
     ...base,
-    ...Object.fromEntries(
-      Object.entries(overrides).filter(([, v]) => v !== null && v !== undefined),
-    ),
-  } as SelectorMap;
+    ...Object.fromEntries(nextEntries),
+  } as T;
 }
 
-// ─── 7. The selector shortcut helper for fast actions ────────────────────────
-//     Call selectorOf(el) inside page.evaluate() to extract the best selector.
-//     Priority: data-test → data-testid → aria-label → id → class
-
-export const SELECTOR_OF_FN = `
-function selectorOf(el) {
-  if (!el) return null;
-  const dt  = el.getAttribute('data-test');    if (dt)  return '[data-test="'    + dt  + '"]';
-  const dti = el.getAttribute('data-testid'); if (dti) return '[data-testid="'  + dti + '"]';
-  const al  = el.getAttribute('aria-label');  if (al)  return '[aria-label="'   + al  + '"]';
-  if (el.id) return '#' + el.id;
-  const cls = String(el.className||'').split(' ').filter(Boolean).slice(0,2).join('.');
-  return el.tagName.toLowerCase() + (cls ? '.' + cls : '');
+/** Convert a DOM element into a CSS selector using the framework priority order. */
+export function selectorOf(element: Element | null): string | null {
+  if (!element) {
+    return null;
+  }
+  const dataTest = element.getAttribute("data-test");
+  if (dataTest) {
+    return `[data-test="${dataTest}"]`;
+  }
+  const dataTestId = element.getAttribute("data-testid");
+  if (dataTestId) {
+    return `[data-testid="${dataTestId}"]`;
+  }
+  const ariaLabel = element.getAttribute("aria-label");
+  if (ariaLabel) {
+    return `[aria-label="${ariaLabel}"]`;
+  }
+  if ((element as HTMLElement).id) {
+    return `#${(element as HTMLElement).id}`;
+  }
+  const className = String((element as HTMLElement).className ?? "")
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .join(".");
+  return `${element.tagName.toLowerCase()}${className ? `.${className}` : ""}`;
 }
-`;
 
-// ─── 8. Discovery function — EDIT THIS for each project ──────────────────────
-//     This is the only function you rewrite per project.
-//     It runs once, fills in selectors, saves the JSON, and never runs again.
+/** Humanize a selector key into a semantic label for Stagehand. */
+export function describeSelectorKey(key: string): string {
+  return key
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/[_-]+/g, " ")
+    .toLowerCase();
+}
 
-export async function discoverSelectors(
+async function getVisibleLocator(page: Page, selector: string, timeoutMs: number): Promise<Locator | null> {
+  const locator = page.locator(selector).first();
+  try {
+    await locator.waitFor({ state: "visible", timeout: timeoutMs });
+    return locator;
+  } catch {
+    return null;
+  }
+}
+
+/** Resolve a selector from cache first, then self-heal with Stagehand when it fails. */
+export async function resolveSelector<T extends SelectorCacheRecord>(
   page: Page,
-  jsonPath = SELECTORS_PATH,
-): Promise<SelectorMap> {
-  const existing = loadSelectors(jsonPath);
+  key: SelectorCacheKey<T>,
+  cached: T,
+  options: ResolveSelectorOptions = {},
+): Promise<Locator | null> {
+  const timeoutMs = options.timeoutMs ?? 1500;
+  const cacheValue = cached[String(key)];
 
-  // Skip discovery if already done
-  if (existing.selectorsDiscovered) {
-    return existing;
+  if (typeof cacheValue === "string" && cacheValue.length > 0) {
+    const cacheHit = await getVisibleLocator(page, cacheValue, timeoutMs);
+    if (cacheHit) {
+      console.log(`[SELECTOR] CACHE HIT for ${String(key)} -> ${cacheValue}`);
+      return cacheHit;
+    }
   }
 
-  const discovered = await page.evaluate((selectorOfFn: string) => {
-    // Inject the selectorOf helper
-    const fn = new Function("return " + selectorOfFn.replace(/^function selectorOf/, "function"))();
+  const stagehand = getActiveStagehand();
+  if (!stagehand) {
+    console.error(`[SELECTOR] No active Stagehand instance is available to resolve ${String(key)}.`);
+    return null;
+  }
 
-    function byText(text: string, tag = "*"): Element | undefined {
-      return Array.from(document.querySelectorAll(tag))
-        .find((el) => (el as HTMLElement).innerText?.trim() === text);
+  const semanticDescription = options.descriptions?.[String(key)] ?? describeSelectorKey(String(key));
+
+  try {
+    const actions = await observe(
+      page,
+      `Find the single best actionable element for "${semanticDescription}" on this page.`,
+    );
+    const resolvedSelector = actions.find((action) => typeof action.selector === "string" && action.selector.length > 0)?.selector;
+
+    if (!resolvedSelector) {
+      console.error(`[SELECTOR] Stagehand could not resolve ${String(key)}.`);
+      return null;
     }
-    function byPlaceholder(text: string): HTMLInputElement | undefined {
-      return Array.from(document.querySelectorAll("input"))
-        .find((el) => el.placeholder?.toLowerCase().includes(text.toLowerCase()));
+
+    const resolvedLocator = await getVisibleLocator(page, resolvedSelector, timeoutMs);
+    if (!resolvedLocator) {
+      console.error(`[SELECTOR] Stagehand returned a selector for ${String(key)}, but it did not become visible: ${resolvedSelector}`);
+      return null;
     }
-    function byRole(role: string): Element | undefined {
-      return document.querySelector(`[role="${role}"]`) ?? undefined;
-    }
 
-    // ── Replace the logic below with discovery specific to your target site ──
-    return {
-      primaryActionBtn:  fn(byText("Submit", "button") ?? byText("Save", "button") ?? byText("Continue", "button")),
-      secondaryActionBtn: fn(byText("Cancel", "button") ?? byText("Back", "button")),
-      mainInput:         fn(byPlaceholder("Search") ?? byPlaceholder("Enter") ?? document.querySelector("input:not([type=hidden])")),
-      searchInput:       fn(byPlaceholder("Search") ?? document.querySelector("[type=search]")),
-      confirmBtn:        fn(byText("Confirm", "button") ?? byText("OK", "button") ?? byText("Yes", "button")),
-      cancelBtn:         fn(byText("Cancel", "button") ?? byText("No", "button") ?? byText("Close", "button")),
-      mainContainer:     fn(byRole("main") ?? document.querySelector("main") ?? document.querySelector("#app, #root, #__next")),
-      dataTable:         fn(document.querySelector("table") ?? document.querySelector("[role=grid]")),
-      dataRow:           fn(document.querySelector("tr:not(:first-child)") ?? document.querySelector("[role=row]")),
-      toastContainer:    fn(document.querySelector("[role=alert]") ?? document.querySelector(".toast, .notification, .snackbar")),
-      errorMessage:      fn(document.querySelector("[role=alert][aria-live=assertive]") ?? document.querySelector(".error, .alert-danger")),
-      loadingIndicator:  fn(document.querySelector("[role=progressbar]") ?? document.querySelector(".loading, .spinner")),
-    };
-  }, SELECTOR_OF_FN) as Partial<SelectorMap>;
+    const nextCached = {
+      ...cached,
+      [String(key)]: resolvedSelector,
+      discoveryNote: `Stagehand refreshed ${String(key)} at ${new Date().toISOString()}`,
+    } as T;
 
-  const merged = mergeSelectors(existing, {
-    ...discovered,
-    selectorsDiscovered: true,
-    discoveryNote: `Selectors discovered from ${page.url()} at ${new Date().toISOString()}`,
-  });
-
-  saveSelectors(merged, jsonPath);
-  return merged;
+    Object.assign(cached, nextCached);
+    saveSelectorCache(nextCached, options.jsonPath ?? getDefaultSelectorsPath());
+    console.log(`[SELECTOR] STAGEHAND RESOLVED ${String(key)} -> ${resolvedSelector}`);
+    return resolvedLocator;
+  } catch (error: unknown) {
+    console.error(
+      `[SELECTOR] Stagehand resolution failed for ${String(key)}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return null;
+  }
 }
-
-// ─── 9. In-memory singleton — import this in your project scripts ─────────────
-//     It loads from JSON at import time (instant, no network call).
-//     Re-run discoverSelectors() only if selectorsDiscovered is false.
-
-export const selectors: SelectorMap = loadSelectors();
-export { SELECTORS_PATH };

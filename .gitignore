@@ -1,0 +1,12 @@
+node_modules/
+.omx/
+
+.env
+.env.*
+
+selectors.json
+screenshots/
+output/
+
+*.log
+*.tsbuildinfo

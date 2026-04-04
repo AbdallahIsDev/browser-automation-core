@@ -1,0 +1,105 @@
+import { Stagehand, type Action, type Page as StagehandPage } from "@browserbasehq/stagehand";
+import type { Page as PlaywrightPage } from "playwright";
+import { z, type ZodTypeAny } from "zod";
+
+export type AutomationPage = PlaywrightPage | StagehandPage;
+
+export interface StagehandConnection {
+  stagehand: Stagehand;
+  page: StagehandPage;
+}
+
+let activeStagehand: Stagehand | null = null;
+
+async function getCdpWebSocketUrl(port: number): Promise<string> {
+  const response = await fetch(`http://localhost:${port}/json/version`, {
+    signal: AbortSignal.timeout(3000),
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to read the CDP browser endpoint for port ${port}.`);
+  }
+
+  const payload = z.object({ webSocketDebuggerUrl: z.string().min(1) }).parse(await response.json());
+  return payload.webSocketDebuggerUrl;
+}
+
+/** Return the active Stagehand instance for selector self-healing. */
+export function getActiveStagehand(): Stagehand | null {
+  return activeStagehand;
+}
+
+/** Attach Stagehand to the existing Chrome debug session and active tab. */
+export async function connectStagehand(port: number, urlPattern: string): Promise<StagehandConnection> {
+  const cdpUrl = await getCdpWebSocketUrl(port);
+  const stagehand = new Stagehand({
+    env: "LOCAL",
+    keepAlive: true,
+    selfHeal: true,
+    disablePino: true,
+    disableAPI: true,
+    verbose: 0,
+    model: "openai/gpt-4o-mini",
+    localBrowserLaunchOptions: {
+      cdpUrl,
+      connectTimeoutMs: 5000,
+    },
+  });
+
+  await stagehand.init();
+  const page = stagehand.context.pages().find((entry: StagehandPage) => entry.url().includes(urlPattern))
+    ?? stagehand.context.pages()[0];
+
+  if (!page) {
+    throw new Error(`Stagehand connected, but no page matched "${urlPattern}".`);
+  }
+
+  stagehand.context.setActivePage(page);
+  activeStagehand = stagehand;
+  return { stagehand, page };
+}
+
+/** Disconnect the active Stagehand instance without closing Chrome. */
+export async function disconnectStagehand(): Promise<void> {
+  if (!activeStagehand) {
+    return;
+  }
+  await activeStagehand.close();
+  activeStagehand = null;
+}
+
+/** Execute a natural-language action with Stagehand and log it. */
+export async function act(page: AutomationPage, instruction: string): Promise<void> {
+  if (!activeStagehand) {
+    throw new Error("Stagehand is not connected.");
+  }
+  console.log(`[STAGEHAND] act -> ${instruction}`);
+  await activeStagehand.act(instruction, { page });
+}
+
+/** Observe the current page state with Stagehand and log it. */
+export async function observe(page: AutomationPage, instruction?: string): Promise<Action[]> {
+  if (!activeStagehand) {
+    throw new Error("Stagehand is not connected.");
+  }
+  console.log(`[STAGEHAND] observe -> ${instruction ?? "page state"}`);
+  if (instruction) {
+    return activeStagehand.observe(instruction, { page });
+  }
+  return activeStagehand.observe({ page });
+}
+
+/** Extract structured data from the page with Stagehand and log it. */
+export async function extract<TSchema extends ZodTypeAny>(
+  page: AutomationPage,
+  schema: TSchema,
+  instruction: string,
+): Promise<z.infer<TSchema>> {
+  if (!activeStagehand) {
+    throw new Error("Stagehand is not connected.");
+  }
+  console.log(`[STAGEHAND] extract -> ${instruction}`);
+  const extractStagehand = activeStagehand as unknown as {
+    extract: (value: string, schemaValue: TSchema, options: { page: AutomationPage }) => Promise<unknown>;
+  };
+  return (await extractStagehand.extract(instruction, schema, { page })) as z.infer<TSchema>;
+}
